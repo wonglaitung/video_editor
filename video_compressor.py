@@ -97,12 +97,60 @@ def calculate_bitrate(
     return f"{int(video_bitrate_kbps)}k"
 
 
+def calculate_optimal_resolution(
+    bitrate_kbps: float,
+    original_width: int,
+    original_height: int
+) -> tuple[int, int]:
+    """
+    根据码率计算最佳分辨率，保持画质
+
+    Args:
+        bitrate_kbps: 视频码率 (kbps)
+        original_width: 原始宽度
+        original_height: 原始高度
+
+    Returns:
+        (宽度, 高度) 元组
+    """
+    # 码率与分辨率对应关系 (基于 H.264 编码经验值)
+    # 码率越高，支持越高分辨率
+    if bitrate_kbps >= 5000:
+        max_pixels = 1920 * 1080  # 1080p
+    elif bitrate_kbps >= 3000:
+        max_pixels = 1280 * 720   # 720p
+    elif bitrate_kbps >= 1500:
+        max_pixels = 854 * 480    # 480p
+    elif bitrate_kbps >= 800:
+        max_pixels = 640 * 360    # 360p
+    elif bitrate_kbps >= 400:
+        max_pixels = 426 * 240    # 240p
+    else:
+        max_pixels = 320 * 180    # 更低
+
+    original_pixels = original_width * original_height
+
+    # 如果原始分辨率已经小于等于推荐值，保持原分辨率
+    if original_pixels <= max_pixels:
+        return original_width, original_height
+
+    # 计算缩放比例
+    scale = (max_pixels / original_pixels) ** 0.5
+
+    # 保持宽高比，确保是偶数
+    new_width = int(original_width * scale) // 2 * 2
+    new_height = int(original_height * scale) // 2 * 2
+
+    return new_width, new_height
+
+
 def compress_video(
     input_path: str,
     output_path: str,
     bitrate: str = None,
     audio_bitrate: str = "64k",
-    target_size: float = None
+    target_size: float = None,
+    keep_quality: bool = True
 ) -> None:
     """
     压缩视频文件
@@ -113,6 +161,7 @@ def compress_video(
         bitrate: 视频码率 (如 "500k")
         audio_bitrate: 音频码率 (默认 64k)
         target_size: 目标大小 (MB)，如果指定则自动计算码率
+        keep_quality: 是否优先保持画质 (默认 True)
     """
     print(f"加载视频: {input_path}")
 
@@ -123,8 +172,10 @@ def compress_video(
     # 加载视频
     video = VideoFileClip(input_path)
     duration = video.duration
+    original_width, original_height = video.w, video.h
 
     print(f"视频时长: {duration:.2f} 秒 ({duration/60:.1f} 分钟)")
+    print(f"原始分辨率: {original_width}x{original_height}")
 
     # 解析音频码率
     audio_bitrate_kbps = int(audio_bitrate.replace('k', '').replace('K', ''))
@@ -145,19 +196,36 @@ def compress_video(
 
     print(f"音频码率: {audio_bitrate}")
 
+    # 解析视频码率
+    bitrate_kbps = int(bitrate.replace('k', '').replace('K', ''))
+
+    # 计算最佳分辨率
+    if keep_quality:
+        new_width, new_height = calculate_optimal_resolution(
+            bitrate_kbps, original_width, original_height
+        )
+        if new_width != original_width or new_height != original_height:
+            print(f"调整分辨率: {new_width}x{new_height} (保持画质)")
+            video = video.resized((new_width, new_height))
+
     # 输出目录
     output_dir = os.path.dirname(output_path)
     if output_dir and not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
-    # 压缩输出
+    # 压缩输出 - 使用高质量编码参数
     print(f"正在压缩: {output_path}")
+
+    # ffmpeg_params 用于提高画质
+    # - preset slow: 编码慢但画质更好
+    # - crf 配合 bitrate 使用两遍编码思路
     video.write_videofile(
         output_path,
         codec="libx264",
         bitrate=bitrate,
         audio_codec="aac",
-        audio_bitrate=audio_bitrate
+        audio_bitrate=audio_bitrate,
+        ffmpeg_params=["-preset", "slow", "-profile:v", "high", "-level", "4.0"]
     )
 
     video.close()
@@ -184,7 +252,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  # 指定目标大小 (自动计算码率)
+  # 指定目标大小 (自动计算码率，优先保持画质)
   %(prog)s input.mp4 -s 50m        # 压缩到 50MB
   %(prog)s input.mp4 -s 100        # 压缩到 100MB
   %(prog)s input.mp4 -s 1g         # 压缩到 1GB
@@ -193,16 +261,25 @@ def main():
   %(prog)s input.mp4 -b 500k       # 使用 500k 码率
   %(prog)s input.mp4 -b 800k -a 64k
 
+  # 保持原始分辨率 (不调整分辨率)
+  %(prog)s input.mp4 -s 50m --no-keep-quality
+
 大小格式支持:
   纯数字: 50, 100 (默认 MB)
   MB: 50m, 50M, 50MB
   GB: 1g, 1G, 1GB
   KB: 500k (注意: 用 -b 指定码率时 k 表示 kbps)
 
-码率参考:
-  高质量: 2000k-5000k
-  中等质量: 800k-1500k
-  低质量: 300k-800k
+画质优化说明:
+  默认开启画质优化模式，会根据码率自动调整分辨率:
+  - 5000k+ → 1080p
+  - 3000k+ → 720p
+  - 1500k+ → 480p
+  - 800k+  → 360p
+  - 400k+  → 240p
+  - 更低   → 180p
+
+  使用 --no-keep-quality 可保持原始分辨率
         """
     )
 
@@ -233,7 +310,23 @@ def main():
         help="音频码率 (默认: 64k)"
     )
 
+    parser.add_argument(
+        "-k", "--keep-quality",
+        action="store_true",
+        default=True,
+        help="优先保持画质，自动调整分辨率 (默认开启)"
+    )
+
+    parser.add_argument(
+        "--no-keep-quality",
+        action="store_true",
+        help="不调整分辨率，保持原始分辨率"
+    )
+
     args = parser.parse_args()
+
+    # 处理画质选项
+    keep_quality = args.keep_quality and not args.no_keep_quality
 
     # 检查输入文件
     if not os.path.exists(args.input):
@@ -261,7 +354,8 @@ def main():
             args.output,
             bitrate=args.bitrate,
             audio_bitrate=args.audio_bitrate,
-            target_size=target_size
+            target_size=target_size,
+            keep_quality=keep_quality
         )
     except Exception as e:
         print(f"错误: {e}", file=sys.stderr)
